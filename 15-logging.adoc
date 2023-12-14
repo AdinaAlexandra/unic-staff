@@ -1,0 +1,326 @@
+## OpenShift Log Aggregation
+In this lab you will explore the logging aggregation capabilities of
+OpenShift.
+
+An extremely important function of OpenShift is collecting and aggregating
+logs from the environments and the application pods it is running. OpenShift
+ships with an elastic log aggregation solution: *EFK*. (**E**lasticSearch,
+**F**luentd and **K**ibana)
+
+The cluster logging components are based upon Elasticsearch, Fluentd, and
+Kibana (EFK). The collector, Fluentd, is deployed to each node in the
+OpenShift cluster. It collects all node and container logs and writes them to
+Elasticsearch (ES). Kibana is the centralized, web UI where users and
+administrators can create rich visualizations and dashboards with the
+aggregated data. Administrators can see and search through all logs.
+Application owners and developers can allow access to logs that belong to
+their projects. The EFK stack runs on top of OpenShift.
+
+[Warning]
+====
+This lab requires that you have completed the infra-nodes lab. The logging
+stack will be installed on the `infra` nodes that were created in that lab.
+====
+
+[Note]
+====
+More information may be found on the official
+link:https://docs.openshift.com/container-platform/4.10/logging/cluster-logging.html[OpenShift
+documentation site]
+====
+
+[Note]
+====
+This exercise is done almost entirely using the OpenShift web console. All of
+the interactions with the web console are effectively creating or
+manipulating API objects in the background. It is possible to fully automate
+the process and/or do it using the CLI or other tools, but these methods are
+not covered in the exercise or documentation at this time.
+====
+
+### Deploying OpenShift Logging
+
+OpenShift Container Platform cluster logging is designed to be used with the
+default configuration, which is tuned for small to medium sized OpenShift
+Container Platform clusters. The installation instructions that follow
+include a sample Cluster Logging Custom Resource (CR), which you can use to
+create a cluster logging instance and configure your cluster logging
+deployment.
+
+If you want to use the default cluster logging install, you can use the
+sample CR directly.
+
+If you want to customize your deployment, make changes to the sample CR as
+needed. The following describes the configurations you can make when
+installing your cluster logging instance or modify after installtion. See the
+Configuring sections for more information on working with each component,
+including modifications you can make outside of the Cluster Logging Custom
+Resource.
+
+#### Create the `openshift-logging` namespace
+
+OpenShift Logging will be run from within its own namespace
+`openshift-logging`. This namespace does not exist by default, and needs to
+be created before logging may be installed. The namespace is represented in
+yaml format as:
+
+[source,yaml]
+.openshift_logging_namespace.yaml
+----
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: openshift-logging
+  annotations:
+    openshift.io/node-selector: ""
+  labels:
+    openshift.io/cluster-logging: "true"
+    openshift.io/cluster-monitoring: "true"
+----
+
+To create the namespace, run the following command:
+
+[source,bash,role="execute"]
+----
+oc create -f support/openshift_logging_namespace.yaml
+----
+
+Verify that it has been created:
+
+[source,bash,role="execute"]
+----
+oc get ns openshift-logging
+----
+
+You should see the following output:
+
+```
+NAME                STATUS   AGE
+openshift-logging   Active   11s
+```
+
+#### Install the `Elasticsearch` and  `Cluster Logging` Operators in the cluster
+
+In order to install and configure the `EFK` stack into the cluster,
+additional operators need to be installed. These can be installed from the
+`Operator Hub` from within the cluster via the GUI.
+
+When using operators in OpenShift, it is important to understand the basics
+of some of the underlying principles that make up the Operators.
+`CustomResourceDefinion (CRD)` and `CustomResource (CR)` are two Kubernetes
+objects that we will briefly describe.`CRDs` are generic pre-defined
+structures of data. The operator understands how to apply the data that is
+defined by the `CRD`. In terms of programming, `CRDs` can be thought as being
+similar to a class. `CustomResource (CR)` is an actual implementations of the
+`CRD`, where the structured data has actual values. These values are what the
+operator will use when configuring it's service. Again, in programming terms,
+`CRs` would be similar to an instantiated object of the class.
+
+The general pattern for using Operators is first, install the Operator, which
+will create the necessary `CRDs`. After the `CRDs` have been created, we can
+create the `CR` which will tell the operator how to act, what to install,
+and/or what to configure. For installing `openshift-logging`, we will follow
+this pattern.
+
+To begin, click on the `Console` tab or use the following link to log-in
+to the OpenShift Cluster's GUI.
+`{{ MASTER_URL }}`
+
+Then follow the following steps:
+
+1. Install the Elasticsearch Operator:
+  a. In the OpenShift console, click `Operators` → `OperatorHub`.
+  b. Type `Elasticsearch Operator` in the search field and click the `OpenShift Elasticsearch Operator` card from the list of available Operators, and then click `Install`.
+  c. On the `Create Operator Subscription` page, select *Update Channel `stable`*, leave all other defaults
+     and then click `Install`.
++
+This makes the Operator available to all users and projects that use this
+OpenShift Container Platform cluster.
+
+2. Install the Cluster Logging Operator:
++
+[Note]
+====
+The `Cluster Logging` operator needs to be installed in the
+`openshift-logging` namespace. Please ensure that the `openshift-logging`
+namespace was created from the previous steps
+====
+
+  a. In the OpenShift console, click `Operators` → `OperatorHub`.
+  b. Type `OpenShift Logging` in the search box and click the  `Red Hat OpenShift Logging` card from the list of available Operators, and click
+    `Install`.
+  c. On the `Install Operator` page, *select Update Channel `stable`*. Under ensure `Installation Mode` ensure that `A specific namespace on the cluster` is selected, and choose
+     `Operator recommended Namespace: openshift-logging` under `Installed Namespace`. Leave all other defaults
+     and then click `Install`.
+
+3. Verify the operator installations:
+
+  a. Switch to the `Operators` → `Installed Operators` page.
+
+  b. Make sure the `openshift-logging` project is selected.
+
+  c. In the _Status_ column you should see green checks with either
+     `InstallSucceeded` or `Copied` and the text _Up to date_.
++
+[Note]
+====
+During installation an operator might display a `Failed` status. If the
+operator then installs with an `InstallSucceeded` message, you can safely
+ignore the `Failed` message. Also, if you're using the `Console` tab, you may
+or maynot see the `Status` column. When in doubt, visit the console via the
+link.
+====
+
+#### Create the Loggging `CustomResource (CR)` instance
+
+Now that we have the operators installed, along with the `CRDs`, we can now
+kick off the logging install by creating a Logging `CR`. This will define how
+we want to install and configure logging.
+
+
+1. In the OpenShift Console, switch to the the `Administration` → `Custom Resource Definitions` page.
+
+2. On the `Custom Resource Definitions` page, search for `Logging` in the search field and click `ClusterLogging`.
+
+3. On the `Custom Resource Definition Overview` page, select `Instances` from the `Actions` menu.
++
+[Note]
+====
+If you see a `404` error, don't panic. While the operator installation
+succeeded, the operator itself has not finished installing and the
+`CustomResourceDefinition` may not have been created yet. Wait a few moments
+and then refresh the page.
+====
++
+4. On the `Cluster Loggings` page, click `Create Cluster Logging`.
+
+5. In the `YAML` editor, replace the code with the following:
+
+[source,yaml]
+.openshift_logging_cr.yaml
+----
+apiVersion: "logging.openshift.io/v1"
+kind: "ClusterLogging"
+metadata:
+  name: "instance"
+  namespace: "openshift-logging"
+spec:
+  managementState: "Managed"
+  logStore:
+    type: "elasticsearch"
+    elasticsearch:
+      nodeCount: 3
+      storage:
+         storageClassName: gp2
+         size: 100Gi
+      redundancyPolicy: "SingleRedundancy"
+      nodeSelector:
+        node-role.kubernetes.io/infra: ""
+      resources:
+        request:
+          memory: 4G
+  visualization:
+    type: "kibana"
+    kibana:
+      replicas: 1
+      nodeSelector:
+        node-role.kubernetes.io/infra: ""
+  curation:
+    type: "curator"
+    curator:
+      schedule: "30 3 * * *"
+      nodeSelector:
+        node-role.kubernetes.io/infra: ""
+  collection:
+    logs:
+      type: "fluentd"
+      fluentd: {}
+      nodeSelector:
+        node-role.kubernetes.io/infra: ""
+----
+
+Then click `Create`.
+
+#### Verify the Loggging install
+
+Now that Logging has been created, let's verify that things are working.
+
+1. Switch to the `Workloads` → `Pods` page.
+
+2. Select the `openshift-logging` project.
+
+You should see pods for cluster logging (the operator itself), Elasticsearch,
+and Fluentd, and Kibana.
+
+Alternatively, you can verify from the command line by using the following command:
+
+[source,bash,role="execute"]
+----
+oc get pods -n openshift-logging -w
+----
+
+You should eventually see something like:
+
+----
+NAME                                            READY   STATUS    RESTARTS   AGE
+cluster-logging-operator-5d4b6f7b99-ksr5s       1/1     Running   0          113s
+collector-2p5fx                                 2/2     Running   0          26s
+collector-7lw5r                                 2/2     Running   0          42s
+collector-8stvf                                 2/2     Running   0          32s
+collector-b7qs8                                 2/2     Running   0          27s
+collector-clfsc                                 2/2     Running   0          16s
+collector-f2tzf                                 2/2     Running   0          31s
+collector-j6hxp                                 2/2     Running   0          10s
+collector-kdvj8                                 2/2     Running   0          30s
+collector-q6wck                                 2/2     Running   0          21s
+collector-sgndk                                 2/2     Running   0          17s
+collector-w5ds9                                 2/2     Running   0          29s
+collector-zswpb                                 2/2     Running   0          34s
+elasticsearch-cdm-mnc985r3-1-5c45b9bd9f-4nx56   2/2     Running   0          70s
+elasticsearch-cdm-mnc985r3-2-779989b7bb-z9dpp   1/2     Running   0          69s
+elasticsearch-cdm-mnc985r3-3-6d754c8cbf-fx8wd   1/2     Running   0          68s
+kibana-655877db88-njsqq                         2/2     Running   0          70s
+----
+
+The _Collector_ *Pods* are deployed as part of a *DaemonSet*, which is a mechanism
+to ensure that specific *Pods* run on specific *Nodes* in the cluster at all
+times:
+
+[source,bash,role="execute"]
+----
+oc get daemonset -n openshift-logging
+----
+
+You will see something like:
+
+----
+oc get daemonset -n openshift-logging
+NAME        DESIRED   CURRENT   READY   UP-TO-DATE   AVAILABLE   NODE SELECTOR            AGE
+collector   9         9         9       9            9           kubernetes.io/os=linux   83s
+----
+
+You should expect 1 `collector` *Pod* for every *Node* in your cluster.
+Remember that *Masters* are still *Nodes* and `collector` will run there, too,
+to slurp the various logs.
+
+You will also see the storage for ElasticSearch has been automatically
+provisioned. If you query the *PersistentVolumeClaim* objects in this project you will see the new storage.
+
+[source,bash,role="execute"]
+----
+oc get pvc -n openshift-logging
+----
+
+You will see something like:
+
+[source,bash,role="execute"]
+----
+NAME                                         STATUS   VOLUME                                     CAPACITY   ACCESS
+MODES   STORAGECLASS                  AGE
+elasticsearch-elasticsearch-cdm-ggzilasv-1   Bound    pvc-f3239564-389c-11ea-bab2-06ca7918708a   100Gi      RWO
+        ocs-storagecluster-ceph-rbd   15m
+elasticsearch-elasticsearch-cdm-ggzilasv-2   Bound    pvc-f324a252-389c-11ea-bab2-06ca7918708a   100Gi      RWO
+        ocs-storagecluster-ceph-rbd   15m
+elasticsearch-elasticsearch-cdm-ggzilasv-3   Bound    pvc-f326aa7d-389c-11ea-bab2-06ca7918708a   100Gi      RWO
+        ocs-storagecluster-ceph-rbd   15m
+----

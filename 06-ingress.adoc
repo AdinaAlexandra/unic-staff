@@ -1,0 +1,560 @@
+# Cluster Network Ingress
+
+
+In OCP, each route can have any number of labels in its metadata field. A router uses selectors (also known as a selection expression) to select a subset of routes from the entire pool of routes to serve. A selection expression can also involve labels on the route's namespace. The selected routes form a router shard.
+
+## Default IngressController in OCP4
+
+In the OCP 3.x version, the router sharding was implemented with patching directly the routers with the “oc adm router” commands for create/manage the routers and their labels, to apply the namespace and route selectors.
+
+But in OCP 4.x, the rules of the game changed: the OCP Routers (and other elements including LBs, DNS entries, etc) are managed by the OpenShift Ingress Operator.
+
+Ingress Operator is an OpenShift component which enables external access to cluster services by configuring Ingress Controllers, which route traffic as specified by OpenShift Route and Kubernetes Ingress resources. Furthermore, the Ingress Operator implements the OpenShift ingresscontroller API.
+
+Into every new OCP4 cluster, the ingresscontroller “default” is deployed into the openshift-ingress-operator namespace:
+
+[source,bash,role="execute"]
+----
+oc get ingresscontroller -n openshift-ingress-operator
+NAME      AGE
+default   50m
+----
+
+As we can see into the ingresscontroller “default”, a ingress controller with replica 2 is deployed. Also pay attention that the spec definition is empty (spec: {}).
+
+[source,bash,role="execute"]
+----
+oc get ingresscontroller default -n openshift-ingress-operator -o yaml
+
+apiVersion: operator.openshift.io/v1
+kind: IngressController
+metadata:
+  name: default <1>
+  namespace: openshift-ingress-operator
+spec:
+  clientTLS:
+    clientCA:
+      name: ""
+    clientCertificatePolicy: ""
+  defaultCertificate:
+    name: wildcard-cert
+  httpEmptyRequestsPolicy: Respond
+  httpErrorCodePages:
+    name: ""
+  logging:
+    access:
+      destination:
+        type: Container
+      logEmptyRequests: Log
+  replicas: 2 <2>
+  unsupportedConfigOverrides: null
+----
+
+<1> Default ingress controller
+<2> In the namespace of “openshift-ingress” the two replicas of the ingress controller “default” are deployed and are running in two separates worker nodes.
+
+[source,bash,role="execute"]
+----
+oc get pod -n openshift-ingress
+NAME                             READY   STATUS    RESTARTS   AGE
+router-default-c54f879dd-4sg5h   2/2     Running   0          8h
+router-default-c54f879dd-ttz8t   2/2     Running   0          131m
+----
+
+This is because of the pod antiaffinity rule defined, that requires that the replicas are not deployed into the same worker node:
+
+[source,bash,role="execute"]
+----
+oc get pod router-default-c54f879dd-4sg5h -n openshift-ingress -o yaml | grep -A12 AntiAffinity                                                      ─╯
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchExpressions:
+          - key: ingresscontroller.operator.openshift.io/deployment-ingresscontroller
+            operator: In
+            values:
+            - default
+        topologyKey: kubernetes.io/hostname
+----
+
+## Router sharding - Adding Ingress Controller for internal and production traffic application routes using routeSelector
+
+In several cases, customers want to have isolated DMZ traffic routes of their applications, from the internal traffic application routes (for example, only reachable from inside the Private subnet of the cluster). And also it's quite a common practice to create logical seggregations for different environments (e.g. internal/development and production)
+
+For this purpose, the :
+
+[source,yaml]
+----
+apiVersion: v1
+items:
+- apiVersion: operator.openshift.io/v1
+  kind: IngressController
+  metadata:
+    name: internal
+    namespace: openshift-ingress-operator
+  spec:
+    domain: internal.cluster-754d.sandbox478.opentlc.com <1>
+    endpointPublishingStrategy: <2>
+      type: LoadBalancerService
+    nodePlacement: <3>
+      nodeSelector:
+        matchLabels:
+          node-role.kubernetes.io/worker: ""
+    routeSelector: <4>
+      matchLabels:
+        type: internal
+  status: {}
+kind: List
+metadata:
+  resourceVersion: ""
+  selfLink: ""
+----
+
+There is several key values into this ingresscontroller:
+
+<1> domain: Wildcard A record internalapps created and managed automatically by the operator.
+<2> endpointPublishingStrategy: used to publish the ingress controller endpoints to other networks, enable load balancer integrations, etc. LoadBalancerService in our case (AWS) for deploy the ELB.
+<3> nodePlacement: NodePlacement describes node scheduling configuration for an ingress controller. In our case have a matchLabel to deploy the ingress controller only into Workers.
+<4> routeSelector: routeSelector is used to filter the set of Routes serviced by the ingress controller. If unset, the default is no filtering. In our case, a label “type: internal” is selected for define these internal routes.
+
+Apply the internal and production ingresscontrollers:
+
+[source,bash,role="execute"]
+----
+cat <<EOF | oc apply -f -
+apiVersion: v1
+items:
+- apiVersion: operator.openshift.io/v1
+  kind: IngressController
+  metadata:
+    name: internal
+    namespace: openshift-ingress-operator
+  spec:
+    domain: internal.cluster-754d.sandbox478.opentlc.com
+    endpointPublishingStrategy:
+      type: LoadBalancerService
+    nodePlacement:
+      nodeSelector:
+        matchLabels:
+          node-role.kubernetes.io/worker: ""
+    routeSelector:
+      matchLabels:
+        type: internal
+  status: {}
+kind: List
+metadata:
+  resourceVersion: ""
+  selfLink: ""
+EOF
+----
+
+And check that are created in the cluster:
+
+[source,bash,role="execute"]
+----
+oc get ingresscontroller -n openshift-ingress-operator
+NAME         AGE
+default      2d
+internal     110s
+production   110s
+----
+
+Furthermore, two replicas of the new brand ingresses controllers appears in the openshift-ingress namespace:
+
+[source,bash,role="execute"]
+----
+oc get pod -n openshift-ingress
+NAME                                 READY   STATUS    RESTARTS   AGE
+router-default-c54f879dd-l4rhb       2/2     Running   0          37m
+router-default-c54f879dd-vckpw       2/2     Running   0          37m
+router-internal-77877b-82wft         1/1     Running   0          2m24s
+router-internal-77877b-vblnr         1/1     Running   0          2m24s
+----
+
+### Testing the Route Sharding I - internal and production application routes
+
+Create a new project and deploy an application for testing purposes (in this case, we use the django-psql-example):
+
+[source,bash,role="execute"]
+----
+oc new-project test-sharding
+oc new-app django-psql-example
+----
+
+The new-app deployment creates two pods, a django frontend and a postgresql database, and also a Service and a Route:
+
+[source,bash,role="execute"]
+----
+oc get route -n test-sharding
+NAME                  HOST/PORT                                                                    PATH   SERVICES              PORT    TERMINATION   WILDCARD
+django-psql-example   django-psql-example-test-sharding.apps.cluster-754d.sandbox478.opentlc.com          django-psql-example   <all>                 None
+----
+
+This route is exposed by default to the “router-default”, using the *apps. domain route.
+
+Let's tweak the route, and add the label that matches to the routeSelector defined into our internal ingresscontroller:
+
+[source,bash,role="execute"]
+----
+cat <<EOF | oc apply -f -
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  labels:
+    app: django-psql-example
+    template: django-psql-example
+    type: internal
+  name: django-psql-example
+  namespace: test-sharding
+spec:
+  host: django-psql-example-test-sharding.internal.cluster-754d.sandbox478.opentlc.com
+  subdomain: ""
+  to:
+    kind: Service
+    name: django-psql-example
+    weight: 100
+  wildcardPolicy: None
+EOF
+----
+
+With a describe of the route, check that the route is created correctly:
+
+[source,bash,role="execute"]
+----
+oc describe route django-psql-example -n test-sharding
+Name:                   django-psql-example
+Namespace:              test-sharding
+Created:                5 minutes ago
+Labels:                 app=django-psql-example
+                        template=django-psql-example
+                        type=internal
+Annotations:            blah blah
+
+                        openshift.io/generated-by=OpenShiftNewApp
+                        openshift.io/host.generated=true
+Requested Host:         django-psql-example-test-sharding.internal.cluster-754d.sandbox478.opentlc.com
+                           exposed on router default (host router-default.apps.cluster-754d.sandbox478.opentlc.com) about a minute ago
+                           exposed on router internal (host router-internal.internal.cluster-754d.sandbox478.opentlc.com) 30 seconds ago
+Path:                   <none>
+TLS Termination:        <none>
+Insecure Policy:        <none>
+Endpoint Port:          <all endpoint ports>
+
+Service:        django-psql-example
+Weight:         100 (100%)
+Endpoints:      <none>
+----
+
+But, wait a minute! Our route is exposed on both routers! (default and internal):
+[source,bash,role="execute"]
+----
+...output omitted...
+Requested Host:         django-psql-example-test-sharding.internal.cluster-754d.sandbox478.opentlc.com
+                           exposed on router default (host router-default.apps.cluster-754d.sandbox478.opentlc.com) about a minute ago
+                           exposed on router internal (host router-internal.internal.cluster-754d.sandbox478.opentlc.com) 30 seconds ago
+...output omitted...
+----
+
+What happened?
+
+By default, the default router have not routeSelector (remember the spec:{} from above?), and for this reason is exposed not only to our internal router, also is exposed to the default.
+
+Check if the route expose by the internal router is working:
+
+[source,bash,role="execute"]
+----
+curl -I django-psql-example-test-sharding.internal.cluster-754d.sandbox478.opentlc.com                                                               ─╯
+HTTP/1.1 200 OK
+server: gunicorn/19.5.0
+date: Sat, 23 Apr 2022 17:13:36 GMT
+content-type: text/html; charset=utf-8
+x-frame-options: SAMEORIGIN
+content-length: 18325
+set-cookie: 76d45f9cc1a5dfd70510f1d6e9de2f11=8c4a1f1227d55d0132818389f26a0c7e; path=/; HttpOnly
+cache-control: private
+----
+
+### Apply a routeSelector matchExpression into Router Default of OCP4
+
+To ONLY expose routes of *.internal to one router (the internal router), and avoid to the default router (that expose the *.apps routes normally), a matchExpression must be defined into the ingresscontroller “default” in the namespace of openshift-ingress-operator:
+
+[source,bash,role="execute"]
+----
+oc get ingresscontroller -n openshift-ingress-operator default -o yaml
+apiVersion: operator.openshift.io/v1
+kind: IngressController
+metadata:
+  name: default
+  namespace: openshift-ingress-operator
+spec:
+  clientTLS:
+    clientCA:
+      name: ""
+    clientCertificatePolicy: ""
+  defaultCertificate:
+    name: wildcard-cert
+  httpEmptyRequestsPolicy: Respond
+  httpErrorCodePages:
+    name: ""
+  logging:
+    access:
+      destination:
+        type: Container
+      logEmptyRequests: Log
+  replicas: 2
+  routeSelector:
+    matchExpressions:
+    - key: type
+      operator: NotIn
+      values:
+      - internal
+  unsupportedConfigOverrides: null
+----
+
+As we see into the definition of the ingresscontroller, the key is:
+
+[source,bash,role="execute"]
+----
+...output omitted...
+spec:
+  routeSelector:
+    matchExpressions:
+    - key: type
+      operator: NotIn
+      values:
+      - internal
+...output omitted...
+----
+
+Let's delete the route first.
+
+[source,bash,role="execute"]
+----
+oc delete route django-psql-example -n test-sharding
+----
+
+Now, and after the edition of the ingresscontroller default with the proper routeSelector matchExpressions, our route is only exposed by the ingresscontroller/router internal only.
+
+[source,bash,role="execute"]
+----
+cat <<EOF | oc apply -f -
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  labels:
+    app: django-psql-example
+    template: django-psql-example
+    type: internal
+  name: django-psql-example
+  namespace: test-sharding
+spec:
+  host: django-psql-example-test-sharding.internal.cluster-754d.sandbox478.opentlc.com
+  subdomain: ""
+  to:
+    kind: Service
+    name: django-psql-example
+    weight: 100
+  wildcardPolicy: None
+EOF
+----
+
+[source,bash,role="execute"]
+----
+oc describe route route django-psql-example -n test-sharding
+Name:                   django-psql-example
+Namespace:              test-sharding
+Created:                2 minutes ago
+Labels:                 app=django-psql-example
+                        template=django-psql-example
+                        type=internal
+Annotations:            blah, blah
+
+Requested Host:         django-psql-example-test-sharding.internal.cluster-754d.sandbox478.opentlc.com
+                           exposed on router internal (host router-internal.internal.cluster-754d.sandbox478.opentlc.com) 2 seconds ago
+Path:                   <none>
+TLS Termination:        <none>
+Insecure Policy:        <none>
+Endpoint Port:          <all endpoint ports>
+
+Service:        django-psql-example
+Weight:         100 (100%)
+Endpoints:      10.129.2.13:8080
+----
+
+Obviously, the route is still working perfectly because is exposed by our internal route:
+
+[source,bash,role="execute"]
+----
+curl -I django-psql-example-test-sharding.internal.cluster-754d.sandbox478.opentlc.com                                                               ─╯
+HTTP/1.1 200 OK
+server: gunicorn/19.5.0
+date: Sat, 23 Apr 2022 17:30:05 GMT
+content-type: text/html; charset=utf-8
+x-frame-options: SAMEORIGIN
+content-length: 18325
+set-cookie: 76d45f9cc1a5dfd70510f1d6e9de2f11=8c4a1f1227d55d0132818389f26a0c7e; path=/; HttpOnly
+cache-control: private
+----
+
+To complete the exercise apply the same steps to create the public route sharding.
+
+## Router sharding - Adding Ingress Controller for internal and public traffic application routes using namespaceSelector
+
+// ### Namespace selector in Route Sharding
+
+Another selectors in the ingresscontrollers are the namespaceSelectors. This selectors, allow that only the routes exposed in that namespaces are served by the routers labeled with this. Remember that the admin user should be the one to create those projects and also make sure that the right labeling is being used (e.g project templates)
+
+As example we can add the namespaceSelector “environment: development/production”, and also combine to the routeSelector: “type: internal/public”. With this combination, we can ensure that our developers only deploys routes to the default/public ingresscontroller/router with two conditions: being in the namespace appropiated and with the label for the routeSelector type public. With only routeSelector, anyone can expose apps to our default/public without any restriction or limit, that with the namespaceSelector have:
+
+[source,bash,role="execute"]
+----
+oc get ingresscontroller -n openshift-ingress-operator default -o yaml | kneat
+apiVersion: operator.openshift.io/v1
+kind: IngressController
+metadata:
+  name: public
+  namespace: openshift-ingress-operator
+spec:
+  clientTLS:
+    clientCA:
+      name: ""
+    clientCertificatePolicy: ""
+  defaultCertificate:
+    name: wildcard-cert
+  httpEmptyRequestsPolicy: Respond
+  httpErrorCodePages:
+    name: ""
+  logging:
+    access:
+      destination:
+        type: Container
+      logEmptyRequests: Log
+  namespaceSelector:
+    matchLabels:
+      environment: production
+    matchExpressions:
+      - key: environment
+        operator: NotIn
+        values:
+          - development
+  replicas: 2
+  routeSelector:
+    matchLabels:
+      type: public
+    matchExpressions:
+      - key: type
+        operator: NotIn
+        values:
+          - internal
+  unsupportedConfigOverrides: null
+----
+
+Let's do the same for internal/development ingress controller
+
+[source,bash,role="execute"]
+----
+oc get ingresscontroller -n openshift-ingress-operator default -o yaml | kneat
+apiVersion: operator.openshift.io/v1
+kind: IngressController
+metadata:
+  name: internal
+  namespace: openshift-ingress-operator
+spec:
+  clientTLS:
+    clientCA:
+      name: ""
+    clientCertificatePolicy: ""
+  defaultCertificate:
+    name: wildcard-cert
+  httpEmptyRequestsPolicy: Respond
+  httpErrorCodePages:
+    name: ""
+  logging:
+    access:
+      destination:
+        type: Container
+      logEmptyRequests: Log
+  namespaceSelector:
+    matchLabels:
+      environment: development
+    matchExpressions:
+      - key: environment
+        operator: NotIn
+        values:
+          - production
+  replicas: 2
+  routeSelector:
+    matchLabels:
+      type: internal
+    matchExpressions:
+      - key: type
+        operator: NotIn
+        values:
+          - public
+  unsupportedConfigOverrides: null
+----
+
+To test out this setup let's create two projects (one for dev and one for prod) and deploy an example app to check everything is working as expected.
+
+[source,bash,role="execute"]
+----
+oc new-project app-dev
+oc label ns app-dev environment=development
+oc new-app rails-postgresql-example
+----
+
+[source,bash,role="execute"]
+----
+oc new-project app-prod
+oc label ns app-prod environment=production
+oc new-app cakephp-mysql-example
+----
+
+Let's recreate the routes
+
+[source,bash,role="execute"]
+----
+oc -n app-dev patch route/rails-postgresql-example --patch '{"metadata":{"labels":{"type":"internal"}}}' --type=merge
+oc -n app-dev patch route/rails-postgresql-example --patch '{"spec":{"host":"rails-postgresql-example-app-dev.internal.cluster-754d.sandbox478.opentlc.com"}}' --type=merge
+oc -n app-prod patch route/cakephp-mysql-example --patch '{"metadata":{"labels":{"type":"public"}}}' --type=merge
+oc -n app-prod patch route/cakephp-mysql-example --patch '{"spec":{"host":"cakephp-mysql-example-app-prod.public.cluster-754d.sandbox478.opentlc.com"}}' --type=merge
+----
+
+Let's check the routes
+
+[source,bash,role="execute"]
+----
+curl -I rails-postgresql-example-app-dev.internal.cluster-754d.sandbox478.opentlc.com
+HTTP/1.1 200 OK
+last-modified: Sun, 24 Apr 2022 09:35:03 GMT
+content-type: text/html
+content-length: 42408
+set-cookie: e01460a64c5700443c6a9c9d2c8dc861=f296e45b08f5b43a4b7cdd0262263cd9; path=/; HttpOnly
+cache-control: private
+----
+
+[source,bash,role="execute"]
+----
+curl -I cakephp-mysql-example-app-prod.public.cluster-754d.sandbox478.opentlc.com
+HTTP/1.1 200 OK
+date: Sun, 24 Apr 2022 09:41:25 GMT
+server: Apache/2.4.37 (Red Hat Enterprise Linux) OpenSSL/1.1.1k
+content-type: text/html; charset=UTF-8
+set-cookie: ba206617cd68145fb88d767a6d5b6d71=8b95823a69aa284ea80445693153f962; path=/; HttpOnly
+cache-control: private
+----
+
+### Clean-up
+
+[source,bash,role="execute"]
+----
+oc delete project app-dev app-prod
+oc delete ingresscontroller internal public -n openshift-ingress-operator
+oc patch ingresscontroller/default -n openshift-ingress-operator --type json -p '[{ "op": "remove", "path": "/spec/namespaceSelector"}]'
+oc patch ingresscontroller/default -n openshift-ingress-operator --type json -p '[{ "op": "remove", "path": "/spec/routeSelector"}]'
+----
+
+
+### Source Links
+
+* https://rcarrata.com/openshift/ocp4_route_sharding/[Deep dive of Route Sharding in OpenShift 4]

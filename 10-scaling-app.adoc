@@ -1,0 +1,159 @@
+## Scaling an Application
+
+### Specifying Pod Replicas in Configuration Workloads
+
+The number of pod replicas for a specific deployment can be increased or decreased to meet your needs. Despite the `ReplicaSet` and `ReplicationController` resources, the number of replicas needed for an application is typically defined in a deployment resource. A replica set or replication controller (managed by a deployment) guarantees that the specified number of replicas of a pod are running at all times. The replica set or replication controller can add or remove pods as necessary to conform to the desired replica count.
+
+Deployment resources contain:
+
+* The desired number of replicas
+* A selector for identifying managed pods
+* A pod definition, or template, for creating a replicated pod (including labels to apply to the pod)
+
+The following deployment resource (created using the `oc create deployment` command) displays the following items:
+
+[source,yaml,role="execute"]
+----
+apiVersion: apps/v1
+kind: Deployment
+...output omitted...
+spec:
+  replicas: 1 <1>
+  selector:
+    matchLabels:
+      deployment: scale <2>
+  strategy: {}
+  template: <3>
+    metadata:
+      labels:
+        deployment: scale <4>
+    spec:
+      containers:
+...output omitted...
+----
+
+<1> Specifies the desired number of copies (or replicas) of the pod to run.
+<2> A replica set uses a selector to count the number of running pods, in the same way that a service uses a selector to find the pods to load balance.
+<3> A template for pods that the replica set or replication controller creates.
+<4> Labels on pods created by the template must match those used for the selector.
+
+If the deployment resource is under version control, then modify the `replicas` line in the resource file and apply the changes using the `oc apply` command.
+
+In a deployment resource, a selector is a set of labels that all of the pods managed by the replica set must match. The same set of labels must be included in the pod definition that the deployment instantiates. This selector is used to determine how many instances of the pod are already running in order to adjust as needed.
+
+. Create a new project for this guided exercise named schedule-scale.
+
+[source,bash,role="execute"]]
+----
+oc new-project schedule-scale
+Now using project "schedule-scale" on server "https://api.cluster-754d.sandbox478.opentlc.com:6443".
+...output omitted...
+----
+
+. Deploy a test application for this exercise which explicitly requests container resources for CPU and memory.
+[source,bash,role="execute"]]
+----
+oc create --save-config -f support/loadtest.yaml                    ─╯
+deployment.apps/loadtest created
+service/loadtest created
+route.route.openshift.io/loadtest created
+----
+
+. Verify that your application pod has a status of Running. You might need to run the oc get pods command multiple times.
+[source,bash,role="execute"]]
+----
+oc get pods
+NAME                        READY   STATUS    RESTARTS   AGE
+loadtest-5f9565dbfb-jm9md   1/1     Running   0          23s
+----
+
+. Verify that your application pod specifies resource limits and requests.
+[source,bash,role="execute"]]
+----
+oc describe pod/loadtest-5f9565dbfb-jm9md | grep -A2 -E "Limits|Requests"
+    Limits:
+      cpu:     100m
+      memory:  100Mi
+    Requests:
+      cpu:        25m
+      memory:     25Mi
+----
+
+. Manually scale the loadtest deployment by first increasing and then decreasing the number of running pods.
+
+.. Scale the loadtest deployment up to five pods.
+
+[source,bash,role="execute"]
+----
+oc scale --replicas 5 deployment/loadtest
+deployment.apps/loadtest scaled
+----
+
+.. Verify that all five application pods are running. You might need to run the oc get pods command multiple times.
+[source,bash,role="execute"]
+----
+oc get po -w                                                        ─╯
+NAME                       READY   STATUS    RESTARTS   AGE
+loadtest-5b96d5f9f-cgq5k   1/1     Running   0          24s
+loadtest-5b96d5f9f-cpck7   1/1     Running   0          123m
+loadtest-5b96d5f9f-gzqg6   1/1     Running   0          24s
+loadtest-5b96d5f9f-whpjt   1/1     Running   0          24s
+loadtest-5b96d5f9f-wrhgk   1/1     Running   0          24s
+----
+
+.. Scale the loadtest deployment back down to one pod.
+
+[source,bash,role="execute"]
+----
+oc scale --replicas 1 deployment/loadtest
+deployment.apps/loadtest scaled
+----
+
+. Configure the loadtest application to automatically scale based on load, and then test the application by applying load.
+.. Create a horizontal pod autoscaler that ensures the loadtest application always has 2 application pods running; that number can be increased to a maximum of 10 pods when CPU load exceeds 50%.
+[source,bash,role="execute"]
+----
+oc autoscale deployment/loadtest --min 2 --max 10 --cpu-percent 50
+horizontalpodautoscaler.autoscaling/loadtest autoscaled
+----
+
+.. Wait until the loadtest horizontal pod autoscaler reports usage in the TARGETS column.
+[source,bash,role="execute"]
+----
+oc get hpa/loadtest
+Every 2,0s: oc get hpa/loadtest                                                                                           fedora: Sun Apr 24 21:45:59 2022
+
+NAME       REFERENCE             TARGETS   MINPODS   MAXPODS   REPLICAS   AGE
+loadtest   Deployment/loadtest   0%/50%    2         10        2          53s
+----
+.. The loadtest container image is designed to either increase CPU or memory load on the container by making a request to the application API. Identify the fully-qualified domain name used in the route.
+[source,bash,role="execute"]
+----
+oc get route/loadtest
+NAME       HOST/PORT                                                          PATH   SERVICES   PORT   TERMINATION   WILDCARD
+loadtest   loadtest-schedule-scale.apps.cluster-754d.sandbox478.opentlc.com          loadtest   8080                 None
+----
+
+.. Access the application API to simulate additional CPU pressure on the container. Move on to the next step while you wait for the curl command to complete.
+[source,bash,role="execute"]
+----
+curl -X GET loadtest-schedule-scale.apps.cluster-754d.sandbox478.opentlc.com/api/loadtest/v1/cpu/1
+----
+
+.. Open a second terminal window and continuously monitor the status of the horizontal pod autoscaler.
+
+[source,bash,role="execute"]
+----
+watch oc get hpa/loadtest
+Every 2,0s: oc get hpa/loadtest          fedora: Sun Apr 24 21:49:31 2022
+
+NAME       REFERENCE             TARGETS    MINPODS   MAXPODS   REPLICAS   AGE
+loadtest   Deployment/loadtest   496%/50%   2         10        6          4m25s
+----
+
+### Clean Up
+
+[source,bash,role="execute"]
+----
+oc delete project template-test
+----
