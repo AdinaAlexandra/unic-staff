@@ -78,7 +78,7 @@ oc new-app https://github.com/RedHatWorkshops/openshiftv4-odo-workshop-backend.g
 -l app.openshift.io/runtime=nodejs,\
 app.kubernetes.io/part-of=multi-tiered-app
 
-oc annotate dc/kiosk-backend app.openshift.io/connects-to=mongodb
+oc annotate deploy/kiosk-backend app.openshift.io/connects-to=mongodb
 ....
 
 * `app.openshift.io/runtime=nodejs` is a runtime label to display icon on web console
@@ -109,10 +109,10 @@ You can watch build logs either using web console or via command line `oc logs b
 In the meanwhile, we will patch the deployment configuration to add environment variables that reference the database secret. This is required for your backend application to make a service connection to the database.
 
 ....
-oc patch dc/kiosk-backend --type='json' -p='[{"op": "add", "path": "/spec/template/spec/containers/0/env", "value": [ { "name": "username", "valueFrom": {  "secretKeyRef": { "name": "mongodb", "key": "database-user" }  } },{ "name": "password", "valueFrom": {  "secretKeyRef": { "name": "mongodb", "key": "database-password" }  } },{ "name": "database_name", "valueFrom": {  "secretKeyRef": { "name": "mongodb", "key": "database-name" }  } },{ "name": "admin_password", "valueFrom": {  "secretKeyRef": { "name": "mongodb", "key": "database-admin-password" }  } } ] }]'
+oc patch deploy/kiosk-backend --type='json' -p='[{"op": "add", "path": "/spec/template/spec/containers/0/env", "value": [ { "name": "username", "valueFrom": {  "secretKeyRef": { "name": "mongodb", "key": "database-user" }  } },{ "name": "password", "valueFrom": {  "secretKeyRef": { "name": "mongodb", "key": "database-password" }  } },{ "name": "database_name", "valueFrom": {  "secretKeyRef": { "name": "mongodb", "key": "database-name" }  } },{ "name": "admin_password", "valueFrom": {  "secretKeyRef": { "name": "mongodb", "key": "database-admin-password" }  } } ] }]'
 ....
 
-Applying this patch will add the following to the deployment configuration. You can check the deployment configuration by running `oc get dc/kiosk-backend -o yaml`.
+Applying this patch will add the following to the deployment configuration. You can check the deployment configuration by running `oc get deploy/kiosk-backend -o yaml`.
 
 ----
     spec:
@@ -185,7 +185,7 @@ app.kubernetes.io/part-of=multi-tiered-app \
 -e COMPONENT_BACKEND_HOST=$(oc get svc kiosk-backend --template={{.spec.clusterIP}}) \
 -e COMPONENT_BACKEND_PORT=$(oc get svc kiosk-backend  -o=jsonpath='{ .spec.ports[?(@.name == "8080-tcp")].targetPort }')
 
-oc annotate dc/kiosk-frontend app.openshift.io/connects-to=kiosk-backend
+oc annotate deploy/kiosk-frontend app.openshift.io/connects-to=kiosk-backend
 ....
 
 * `COMPONENT_BACKEND_HOST` is an env variable that points to backend service

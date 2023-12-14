@@ -9,6 +9,7 @@ First we will deploy an application, scale it up and down manually. We will also
 
 Then we will learn to setup horizontal pod autocaler that automatically scales your application based on the workload and scales down when the workload reduces.
 
+Remember to replace UserName with a random string/value
 
 
 == Deploy an Application to Scale
