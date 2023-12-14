@@ -56,6 +56,8 @@ sudo apt update
 sudo apt-get install -y podman skopeo buildah
 
 
+
+##end
 at the gitops labs:
 argocd login gitops url 
 
